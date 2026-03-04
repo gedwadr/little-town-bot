@@ -47,12 +47,23 @@ class GameParser:
         self._always_available = [1]  # Wheat Field is always in market
         self.market = list(initial_market)  # shrinks as buildings are bought
 
+        # Gap 1: Wheat Field supply — only 5 tiles exist
+        self.wheat_fields_remaining = 5
+        # Gap 2: Resource bank — global supply caps; updated from gameState when available
+        self.bank = {"wood": 15, "stone": 15, "fish": 15, "wheat": 15}
+
         # Pre-populate from catalogue so we never show "B2" unknowns
         self.mkt_names: dict = {bid: BUILDINGS[bid]["name"] for bid in BUILDINGS}
 
         # State trackers — updated on every ingest_event()
         self.board   = BoardTracker(initial_map)
         self.players = PlayerTracker(self.player_ids, player_names)
+
+        # Gap 3: initialise housesRemaining from player count (before any events)
+        _slots = {2: 7, 3: 6, 4: 6}
+        initial_slots = _slots.get(len(self.player_ids), 6)
+        for pid in self.player_ids:
+            self.players.states[pid]["housesRemaining"] = initial_slots
 
         # History of completed turns (formatted strings)
         self.history: list = []
@@ -155,6 +166,23 @@ class GameParser:
                 bid  = BUILDING_NAME_TO_ID.get(name)
                 if bid and bid in self.market:
                     self.market.remove(bid)
+                # Gap 1: track Wheat Field supply
+                if bid == 1 and self.wheat_fields_remaining > 0:
+                    self.wheat_fields_remaining -= 1
+                # Gap 3: track building slots locally (works in replay too)
+                if player in self.players.states:
+                    h = self.players.states[player].get("housesRemaining", 0)
+                    if h > 0:
+                        self.players.states[player]["housesRemaining"] = h - 1
+
+        # Gap 1 + 2 + 3: sync from gameState snapshot when available
+        gs = event.get("gameState", {})
+        if "bank" in gs:
+            self.bank.update(gs["bank"])
+            self.wheat_fields_remaining = gs["wheatFieldsRemaining"]
+            for pid, pstate in gs.get("players", {}).items():
+                if pid in self.players.states:
+                    self.players.update_houses(pid, pstate.get("housesRemaining", 0))
 
         # Skip system events for turn grouping
         if player == "system" or turn_n is None:
@@ -255,6 +283,7 @@ class GameParser:
             f"Round {round_num} of 4  |  Turn {turn_num}  |  "
             f"You are P{player_id} ({self.player_names.get(player_id, '?')})\n\n"
             f"PLAYER STATES:\n{players_snap}\n\n"
+            f"RESOURCE BANK:\n{self._bank_str()}\n\n"
             f"MARKET (buildings available to buy):\n{market_snap}\n\n"
             f"BUILDINGS ON BOARD:\n{buildings_str}\n\n"
             f"{board_snap}\n"
@@ -371,7 +400,9 @@ class GameParser:
 
     def _available_market(self) -> list:
         """Market pool: always-available buildings + remaining random market."""
-        return self._always_available + self.market
+        always = [bid for bid in self._always_available
+                  if bid != 1 or self.wheat_fields_remaining > 0]
+        return always + self.market
 
     def _market_str(self, mkt_ids: list) -> str:
         parts = []
@@ -382,8 +413,17 @@ class GameParser:
             build_vp= b.get("buildVP", "?")
             effect  = b.get("effect", "?")
             always  = " [always]" if b.get("alwaysAvailable") else ""
-            parts.append(f"  [{bid}] {name}{always}  cost:{cost}  buildVP:{build_vp}  {effect}")
+            supply  = f" ({self.wheat_fields_remaining} left)" if bid == 1 else ""
+            parts.append(f"  [{bid}] {name}{always}{supply}  cost:{cost}  buildVP:{build_vp}  {effect}")
         return "\n".join(parts) if parts else "  (market empty)"
+
+    def _bank_str(self) -> str:
+        parts = []
+        for res in ("wood", "stone", "fish", "wheat"):
+            v = self.bank.get(res, 0)
+            warn = " [LOW]" if v < 3 else ""
+            parts.append(f"{res}:{v}{warn}")
+        return "  " + "  ".join(parts)
 
     def _build_setup_header(self) -> str:
         map_str     = " / ".join(self.initial_map)
@@ -391,6 +431,8 @@ class GameParser:
         players_str = "  ".join(
             f"P{pid}:{self.player_names.get(pid, '?')}" for pid in self.player_ids
         )
+        _worker_slots = {2: (5, 7), 3: (4, 6), 4: (3, 6)}
+        workers, slots = _worker_slots.get(len(self.player_ids), (3, 6))
         # Initial market summary
         init_mkt = self._market_str(self._always_available + self.initial_market)
         return (
@@ -399,6 +441,7 @@ class GameParser:
             f"(board {self.board_side}): {map_str}\n"
             f"Players: {players_str}\n"
             f"Turn order: {order_str}\n"
+            f"Workers per player: {workers}  Building slots per player: {slots}\n"
             f"Initial market:\n{init_mkt}\n"
         )
 

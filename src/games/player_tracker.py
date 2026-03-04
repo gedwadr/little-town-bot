@@ -16,6 +16,7 @@ class PlayerTracker:
                 "coins":            3,
                 "vp":               0,
                 "workersRemaining": 3,
+                "housesRemaining":  0,
             }
             for pid in player_ids
         }
@@ -24,12 +25,18 @@ class PlayerTracker:
         player = event.get("player")
         ps     = event.get("playerState")
         if player and ps and player != "system":
+            current = self.states.get(player, {})
             self.states[player] = {
                 "resources":        ps.get("resources", {}),
                 "coins":            ps.get("coins", 0),
                 "vp":               ps.get("vp", 0),
                 "workersRemaining": ps.get("workersRemaining", 0),
+                "housesRemaining":  current.get("housesRemaining", 0),
             }
+
+    def update_houses(self, player_id: str, value: int):
+        if player_id in self.states:
+            self.states[player_id]["housesRemaining"] = value
 
     def get(self, player_id: str) -> dict:
         return self.states.get(player_id, {})
@@ -52,7 +59,7 @@ class PlayerTracker:
                 f"Wd:{r.get('wood',0)} St:{r.get('stone',0)} "
                 f"Fi:{r.get('fish',0)} Wh:{r.get('wheat',0)}  "
                 f"Coins:{s['coins']}  VP:{s['vp']}  "
-                f"Workers:{s['workersRemaining']}"
+                f"Workers:{s['workersRemaining']}  Slots:{s['housesRemaining']}"
                 f"{food_warn}{you}"
             )
         return "\n".join(lines)
