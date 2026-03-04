@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 
 BASE_URL = "https://majapahit-app.azurewebsites.net/api/archive"
-OUTPUT_DIR = Path("logs/matchLogs")
+OUTPUT_DIR = Path("../../logs/matchLogs")
 MAX_PAGES = 100
 CONCURRENCY = 10  # simultaneous match-detail requests
 
