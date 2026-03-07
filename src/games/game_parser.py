@@ -255,7 +255,7 @@ class GameParser:
         round_num = t.round_num if t else "?"
         turn_num  = t.turn_num  if t else "?"
 
-        history_str   = "\n".join(self.history) if self.history else "(game start — no moves yet)"
+        last_action   = self.history[-1] if self.history else "(game start — no moves yet)"
         board_snap    = self.board.compress()
         players_snap  = self.players.compress(current_player=player_id)
         buildings     = self.board.buildings_on_board()
@@ -276,8 +276,8 @@ class GameParser:
 
         user_content = (
             f"{self._setup_header}\n"
-            f"=== HISTORY SO FAR ===\n"
-            f"{history_str}\n"
+            f"=== LAST ACTION ===\n"
+            f"{last_action}\n"
             f"{instr_block}\n"
             f"=== YOUR TURN ===\n"
             f"Round {round_num} of 4  |  Turn {turn_num}  |  "
@@ -442,7 +442,7 @@ class GameParser:
             f"Players: {players_str}\n"
             f"Turn order: {order_str}\n"
             f"Workers per player: {workers}  Building slots per player: {slots}\n"
-            f"Initial market:\n{init_mkt}\n"
+            # f"Initial market:\n{init_mkt}\n"
         )
 
     def __repr__(self) -> str:
