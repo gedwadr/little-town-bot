@@ -124,3 +124,25 @@ class BoardTracker:
             if self.terrain[r][c] == "G" and self.is_empty(r, c)
         ]
 
+    def is_empty_grass(self, r: int, c: int) -> bool:
+        """True if cell is grass with no worker and no building."""
+        if not (0 <= r < self.rows and 0 <= c < self.cols):
+            return False
+        return (
+                self.terrain[r][c] == "G"
+                and self.workers[r][c] is None
+                and self.buildings[r][c] is None
+        )
+
+    def has_building_at(self, r: int, c: int, name: str) -> bool:
+        """True if a building with this name exists at (r, c)."""
+        if not (0 <= r < self.rows and 0 <= c < self.cols):
+            return False
+        b = self.buildings[r][c]
+        return b is not None and b.get("name") == name
+
+    def has_worker_at(self, r: int, c: int, player_id: str) -> bool:
+        """True if player's worker is at (r, c)."""
+        if not (0 <= r < self.rows and 0 <= c < self.cols):
+            return False
+        return self.workers[r][c] == player_id

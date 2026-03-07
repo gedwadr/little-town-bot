@@ -81,16 +81,30 @@ class GameParser:
 
     @classmethod
     def from_file(cls, path: str) -> "GameParser":
-        """Load a saved match JSON file and ingest all events."""
+        """
+        Load a match JSON file and ingest all events.
+        Automatically detects end-game format (has 'match' key)
+        or live format (has 'log' key only).
+        """
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        return cls.from_match_data(data)
+        if "match" in data:
+            return cls.from_match_data(data)
+        elif "log" in data:
+            return cls.from_live_data(data)
+        else:
+            raise ValueError(
+                f"Unrecognised format in {path}: "
+                f"expected 'match' or 'log' key, got {list(data.keys())}"
+            )
 
     @classmethod
     def from_match_data(cls, data: dict) -> "GameParser":
         """
-        Construct from a parsed match dict and ingest all events.
+        Construct from a parsed end-game match dict and ingest all events.
         Use when you already have the JSON in memory.
+        End-game format: { match: { player_names, initial_map, initial_market,
+                                    full_log, winner_id, board_side, ... } }
         """
         match = data["match"]
 
@@ -114,6 +128,92 @@ class GameParser:
             parser.ingest_event(event)
 
         return parser
+
+    @classmethod
+    def from_live_data(cls, data: dict) -> "GameParser":
+        """
+        Construct from a live game dict and ingest all events so far.
+        Live format: { log: [...events...] }
+        Missing fields (player_names, initial_map, board_side, winner_id)
+        are reconstructed from the first gameState in the log.
+
+        Player display names default to 'P0', 'P1', ... since the live
+        format does not include them. Pass a player_names override if
+        you have them from elsewhere.
+        """
+        log = data["log"]
+        if not log:
+            raise ValueError("Live game log is empty — cannot reconstruct metadata.")
+
+        meta = cls._extract_meta_from_live_log(log)
+
+        parser = cls(
+            initial_map    = meta["initial_map"],
+            initial_market = meta["initial_market"],
+            player_names   = meta["player_names"],
+            turn_order     = meta["turn_order"],
+            winner_id      = meta.get("winner_id"),
+            board_side     = meta.get("board_side", "?"),
+        )
+        for event in log:
+            parser.ingest_event(event)
+
+        return parser
+
+    @staticmethod
+    def _extract_meta_from_live_log(log: list) -> dict:
+        """
+        Reconstruct the metadata that end-game format stores explicitly
+        but live format omits — by reading the first gameState snapshot.
+
+        Returns a dict with:
+            initial_map, initial_market, player_names, turn_order,
+            winner_id (None for live), board_side ('?')
+        """
+        # Find first event that has a full gameState with board + market
+        first_gs = None
+        for event in log:
+            gs = event.get("gameState", {})
+            if "board" in gs and "market" in gs:
+                first_gs = gs
+                break
+
+        if first_gs is None:
+            raise ValueError(
+                "No gameState with board+market found in live log. "
+                "Cannot reconstruct map or market."
+            )
+
+        # Reconstruct initial_map from board terrain grid
+        terrain_map = {
+            "mountain": "M",
+            "grass":    "G",
+            "forest":   "F",
+            "lake":     "L",
+        }
+        initial_map = []
+        for row in first_gs["board"]:
+            row_str = "".join(terrain_map.get(cell["terrain"], "?") for cell in row)
+            initial_map.append(row_str)
+
+        # initial_market from first gameState (excludes Wheat Field id=1)
+        initial_market = [bid for bid in first_gs["market"] if bid != 1]
+
+        # Player IDs and default display names (P0, P1, ...)
+        player_ids = sorted(first_gs.get("players", {}).keys(), key=lambda x: int(x))
+        player_names = {pid: f"P{pid}" for pid in player_ids}
+
+        # Turn order
+        turn_order = first_gs.get("turnOrder", player_ids)
+
+        return {
+            "initial_map":    initial_map,
+            "initial_market": initial_market,
+            "player_names":   player_names,
+            "turn_order":     turn_order,
+            "winner_id":      None,   # not known until game ends
+            "board_side":     "?",    # not present in live format
+        }
 
     @classmethod
     def from_match_init(cls, meta: dict) -> "GameParser":
