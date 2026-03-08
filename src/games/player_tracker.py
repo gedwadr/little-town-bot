@@ -38,6 +38,19 @@ class PlayerTracker:
         if player_id in self.states:
             self.states[player_id]["housesRemaining"] = value
 
+    def update_from_game_state(self, player_id: str, pstate: dict):
+        """Sync all player fields from a LogGameState.players[pid] snapshot."""
+        if player_id not in self.states:
+            return
+        current = self.states[player_id]
+        self.states[player_id] = {
+            "resources":        pstate.get("resources", current.get("resources", {})),
+            "coins":            pstate.get("coins",     current.get("coins", 0)),
+            "vp":               pstate.get("vp",        current.get("vp", 0)),
+            "workersRemaining": pstate.get("workersRemaining", current.get("workersRemaining", 0)),
+            "housesRemaining":  pstate.get("housesRemaining",  current.get("housesRemaining", 0)),
+        }
+
     def get(self, player_id: str) -> dict:
         return self.states.get(player_id, {})
 

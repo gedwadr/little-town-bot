@@ -282,7 +282,7 @@ class GameParser:
             self.wheat_fields_remaining = gs["wheatFieldsRemaining"]
             for pid, pstate in gs.get("players", {}).items():
                 if pid in self.players.states:
-                    self.players.update_houses(pid, pstate.get("housesRemaining", 0))
+                    self.players.update_from_game_state(pid, pstate)
 
         # Skip system events for turn grouping
         if player == "system" or turn_n is None:
@@ -360,7 +360,7 @@ class GameParser:
         players_snap  = self.players.compress(current_player=player_id)
         buildings     = self.board.buildings_on_board()
         buildings_str = "\n".join(f"  {b}" for b in buildings) if buildings else "  (none yet)"
-        market_snap   = self._market_str(self._available_market())
+        market_snap   = self._market_str(self.available_market())
         instr_block   = f"\nSTRATEGY INSTRUCTION: {instruction}\n" if instruction else ""
 
         # Optional: show top candidate placements
@@ -489,7 +489,7 @@ class GameParser:
             "round":          t.round_num if t else None,
             "turn":           t.turn_num  if t else None,
             "current_player": self.current_player(),
-            "market":         [self.mkt_names.get(bid, f"B{bid}") for bid in self._available_market()],
+            "market":         [self.mkt_names.get(bid, f"B{bid}") for bid in self.available_market()],
             "players":        deepcopy(self.players.states),
             "buildings":      self.board.buildings_on_board(),
             "history_length": len(self.history),
@@ -498,7 +498,7 @@ class GameParser:
 
     # ── internals ─────────────────────────────────────────────
 
-    def _available_market(self) -> list:
+    def available_market(self) -> list:
         """Market pool: always-available buildings + remaining random market."""
         always = [bid for bid in self._always_available
                   if bid != 1 or self.wheat_fields_remaining > 0]

@@ -1,6 +1,8 @@
+from itertools import combinations
 
 from src.games.game_parser import GameParser
-from src.constant import BUILDING_NAME_TO_ID
+from src.constant import BUILDING_NAME_TO_ID, BUILDINGS
+
 
 class ActionValidator:
     """
@@ -175,7 +177,7 @@ class ActionValidator:
                 bid = BUILDING_NAME_TO_ID.get(name)
                 if bid is None:
                     break   # unknown building name
-                available = self.parser._available_market()
+                available = self.parser.available_market()
                 if bid not in available:
                     break   # not in current market
                 # Check cell is empty grass
@@ -223,6 +225,69 @@ class ActionValidator:
                 valid.append(line)
 
         return valid
+
+    def get_legal_moves(self, player_id) -> list[str]:
+        moves = []
+        state = self.parser.players.states[player_id]
+        board = self.parser.board
+        resources = state.get("resources", {})
+        coins = state.get("coins", 0)
+        workers = state.get("workersRemaining", 0)
+
+        # ── placeWorker (all subsets of adjacent building activations) ─
+        if workers > 0:
+            for r, c in board.empty_grass_cells():
+                # Find all adjacent buildings
+                adjacent_activations = []
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+
+                        ar, ac = r + dr, c + dc
+                        if not (0 <= ar < board.rows and 0 <= ac < board.cols):
+                            continue
+                        b = board.buildings[ar][ac]
+                        if b is not None:
+                            adjacent_activations.append(
+                                f"activate {b['name']} {ar} {ac}"
+                            )
+
+                if not adjacent_activations:
+                    # No adjacent buildings — just the placement
+                    moves.append(f"placeWorker {r} {c}")
+                else:
+                    # Generate all non-empty subsets of activations
+                    for size in range(1, len(adjacent_activations) + 1):
+                        for subset in combinations(adjacent_activations, size):
+                            action_sequence = [f"placeWorker {r} {c}"] + list(subset)
+                            moves.append("\n".join(action_sequence))
+
+                    # Also include bare placement (choose to activate nothing)
+                    moves.append(f"placeWorker {r} {c}")
+
+        # ── substituteResource ────────────────────────────────────────
+        if coins >= 3:
+            for res in ("wood", "stone", "fish", "wheat"):
+                moves.append(f"substituteResource {res}")
+
+        # ── buildBuilding ─────────────────────────────────────────────
+        slots = state.get("housesRemaining", 0)
+        if slots > 0:
+            for bid in self.parser.available_market():
+                b = BUILDINGS.get(bid, {})
+                cost = b.get("cost", {})
+                name = b.get("name", "")
+                can_afford = all(
+                    (coins >= amt if res == "coins"
+                     else resources.get(res, 0) >= amt)
+                    for res, amt in cost.items()
+                )
+                if can_afford:
+                    for r, c in board.empty_grass_cells():
+                        moves.append(f"buildBuilding {name} {r} {c}")
+
+        return moves
 
     def _worker_adjacent(self, br, bc, placed_this_turn, player_id):
         """Check if any worker (placed this turn or already on board) is adjacent to (br, bc)."""
