@@ -3,7 +3,7 @@ import time
 import requests
 
 URL = "http://localhost:8000/api/bot-match"
-INTERVAL_SECONDS = 90
+INTERVAL_SECONDS = 75
 
 
 def trigger_match():
