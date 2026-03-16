@@ -8,12 +8,14 @@ INTERVAL_SECONDS = 75
 
 def trigger_match():
     payload = {
-        "numPlayers": 2,
+        "numPlayers": 4,
         "boardSide": random.choice(["A", "B"]),
         "randomizeTurnOrder": True,
         "bots": [
-            {"playerID": "0"},
-            {"playerID": "1", "serviceUrl": "http://localhost:9000", "botName": "QwenSFT-RL"},
+            {"playerID": "0", "serviceUrl": "http://localhost:9002", "botName": "ResNet-SFT"},
+            {"playerID": "1", "serviceUrl": "http://localhost:9001", "botName": "ResNet-RL"},
+            {"playerID": "2", "serviceUrl": "http://localhost:9002", "botName": "ResNet-SFT"},
+            {"playerID": "3"},
         ],
     }
     try:

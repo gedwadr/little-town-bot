@@ -80,18 +80,22 @@ class GameParser:
     # ── constructors ──────────────────────────────────────────
 
     @classmethod
-    def from_file(cls, path: str) -> "GameParser":
+    def from_file(cls, path: str, parser_cls=None) -> "GameParser":
         """
         Load a match JSON file and ingest all events.
         Automatically detects end-game format (has 'match' key)
         or live format (has 'log' key only).
+
+        parser_cls: optional subclass to instantiate instead of cls
+                    e.g. parser_cls=GameParserNN
         """
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+        target = parser_cls or cls
         if "match" in data:
-            return cls.from_match_data(data)
+            return target.from_match_data(data)
         elif "log" in data:
-            return cls.from_live_data(data)
+            return target.from_live_data(data)
         else:
             raise ValueError(
                 f"Unrecognised format in {path}: "
@@ -99,13 +103,17 @@ class GameParser:
             )
 
     @classmethod
-    def from_match_data(cls, data: dict) -> "GameParser":
+    def from_match_data(cls, data: dict, parser_cls=None) -> "GameParser":
         """
         Construct from a parsed end-game match dict and ingest all events.
         Use when you already have the JSON in memory.
         End-game format: { match: { player_names, initial_map, initial_market,
                                     full_log, winner_id, board_side, ... } }
+
+        parser_cls: optional subclass to instantiate instead of cls
+                    e.g. parser_cls=GameParserNN
         """
+        target = parser_cls or cls
         match = data["match"]
 
         # Extract turn order from first turnOrder event
@@ -116,7 +124,7 @@ class GameParser:
                 turn_order = gs.get("turnOrder", turn_order)
                 break
 
-        parser = cls(
+        parser = target(
             initial_map    = match["initial_map"],
             initial_market = match["initial_market"],
             player_names   = match["player_names"],
@@ -130,7 +138,7 @@ class GameParser:
         return parser
 
     @classmethod
-    def from_live_data(cls, data: dict) -> "GameParser":
+    def from_live_data(cls, data: dict, parser_cls=None) -> "GameParser":
         """
         Construct from a live game dict and ingest all events so far.
         Live format: { log: [...events...] }
@@ -140,14 +148,18 @@ class GameParser:
         Player display names default to 'P0', 'P1', ... since the live
         format does not include them. Pass a player_names override if
         you have them from elsewhere.
+
+        parser_cls: optional subclass to instantiate instead of cls
+                    e.g. parser_cls=GameParserNN
         """
+        target = parser_cls or cls
         log = data["log"]
         if not log:
             raise ValueError("Live game log is empty — cannot reconstruct metadata.")
 
         meta = cls._extract_meta_from_live_log(log)
 
-        parser = cls(
+        parser = target(
             initial_map    = meta["initial_map"],
             initial_market = meta["initial_market"],
             player_names   = meta["player_names"],

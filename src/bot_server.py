@@ -1,8 +1,10 @@
 import json
 import math
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import torch
+import bitsandbytes as bnb
 from datetime import datetime
 
 from accelerate.utils import add_model_config_to_megatron_parser
@@ -27,7 +29,7 @@ app = Flask(__name__)
 
 bot = BotV1(
         model_path="./models/qwen2.5-1.5b-instruct",
-        adapter_path="./checkpoints/RL/checkpoint-1331"
+        adapter_path="./checkpoints/boardgame-v2/all_player/checkpoint-2066"
     )
 
 for name, param in bot.model.named_parameters():
@@ -37,7 +39,7 @@ for name, param in bot.model.named_parameters():
         param.requires_grad = False
 
 trainable_parameter = [p for p in bot.model.parameters() if p.requires_grad]
-optimizer = torch.optim.Adam(trainable_parameter, lr=1e-5)
+optimizer = bnb.optim.PagedAdamW8bit(trainable_parameter, lr=1e-5)
 game_count = 0
 
 episodes = defaultdict(lambda: {
@@ -65,29 +67,44 @@ def get_move():
     game_parser = GameParser.from_live_data(log_data)
 
     action_validator = ActionValidator(game_parser)
-    legal_moves = action_validator.get_legal_moves(player_id)
-    if not legal_moves:
+    model_moves, move_map = action_validator.get_legal_moves_v2(player_id)
+
+    illegal_majapahit = data.get("illegal_moves", [])
+    if illegal_majapahit:
+        illegal_set = {
+            (m["move"], json.dumps(m.get("args", []), sort_keys=True))
+            for m in illegal_majapahit
+        }
+        model_moves = [
+            mm for mm in model_moves
+            if move_map.get(mm) and
+               (move_map[mm][0]["move"], json.dumps(move_map[mm][0].get("args", []), sort_keys=True)) not in illegal_set
+        ]
+        if illegal_majapahit:
+            print(f"[illegal_moves] filtered {len(illegal_majapahit)} illegal moves, {len(model_moves)} remaining")
+
+    if not model_moves:
         print("no legal moves")
         return jsonify({"actions": [], "error": "no legal moves"})
 
     # Build prompt
     prompt = game_parser.build_prompt(player_id=player_id)
-    full_prompt = prompt["system"] + "\n" + prompt["user"]
+    full_prompt = prompt["user"]
 
     # Sample action (with log_prob for RL)
     action, log_prob = sample_action(
         model       = bot.model,
         tokenizer   = bot.tokenizer,
         prompt      = full_prompt,
-        legal_moves = legal_moves,
+        legal_moves = model_moves,
         game_count  = game_count
     )
 
-    has_activation = "activate" in action
-    activation_moves = [m for m in legal_moves if "activate" in m]
+    has_activation = action.startswith("work ")
+    activation_moves = [m for m in model_moves if m.startswith("work ")]
 
     move_record = {
-        'legal_moves_count': len(legal_moves),
+        'legal_moves_count': len(model_moves),
         'activations_count': len(activation_moves),
         'activating': has_activation,
         'action': action
@@ -95,9 +112,13 @@ def get_move():
     with open(MOVE_FILE, "a") as f:
         f.write(json.dumps(move_record) + "\n")
 
-    # Convert the sampled string action to Majapahit { move, args } format.
-    # Falls back to the first legal Majapahit move if conversion fails.
-    majapahit_action = action_validator.to_majapahit_move(action, player_id, majapahit_moves)
+    # Convert sampled action to Majapahit { move, args } format via move_map.
+    # Falls back to server-provided moves if not found.
+    candidates = move_map.get(action, [])
+    if candidates:
+        majapahit_action = candidates[0]
+    else:
+        majapahit_action = action_validator.to_majapahit_move(action, player_id, majapahit_moves)
     if majapahit_action is None:
         if not majapahit_moves:
             return jsonify({"actions": [], "error": "could not convert action and no fallback moves"})
@@ -112,18 +133,33 @@ def get_move():
     ep["player_id"] = player_id
     if ep["actions"]:  # not the first turn
         vp_delta = vp_now - ep.get("vp_at_last_turn", vp_now)
-        step_reward = max(0, vp_delta * 0.1) if game_count < 100 else vp_delta * 0.1
-        step_reward += 0.02
+
+        # ── VP reward (always present) ────────────────────────────
+        vp_reward = max(0, vp_delta * 0.1)
+
+        # ── Feeding reward (fades out after game 300) ─────────────
+        feeding_reward = _compute_feeding_reward(
+            state      = game_parser.players.states.get(player_id, {}),
+            prev_food  = ep.get("food_at_last_turn", 0),
+            game_count = game_count,
+        )
+
+        step_reward = vp_reward + feeding_reward
         ep["rewards"].append(step_reward)
 
-        # Debug — should now be non-zero when buildings activated
-        print(f"[REWARD] game={game_id} vp_delta={vp_delta} "
+        print(f"[REWARD] game={game_id} | vp_delta={vp_delta:.2f} "
+              f"vp_reward={vp_reward:.3f} | "
+              f"feeding_reward={feeding_reward:.3f} | "
               f"step_reward={step_reward:.3f}")
 
-    ep["actions"].append(action)
+    ep["actions"].append({"prompt": full_prompt[:-300], "action": action})
 
 
     ep["vp_at_last_turn"] = vp_now
+
+    # Track food for feeding reward next turn
+    resources = game_parser.players.states.get(player_id, {}).get("resources", {})
+    ep["food_at_last_turn"] = resources.get("fish", 0) + resources.get("wheat", 0)
 
     return jsonify({"actions": [majapahit_action]})
 
@@ -149,8 +185,7 @@ def game_result():
         print(f"End-game VP bonus detected: +{last_turn_vp_delta} VP "
               f"(from {vp_at_last_turn} → {final_vp})")
 
-    last_step_reward = max(0, last_turn_vp_delta * 0.1) if game_count < 100 else last_turn_vp_delta * 0.1
-    last_step_reward += 0.02
+    last_step_reward = max(0, last_turn_vp_delta * 0.1)
     ep["rewards"].append(last_step_reward)
 
     # ── Final placement bonus ─────────────────────────────────────
@@ -169,6 +204,7 @@ def game_result():
 
     # Run RL update
     _rl_update(ep, bot.model, bot.tokenizer)
+    torch.cuda.empty_cache()
     game_count += 1
 
     game_stats.append({
@@ -192,26 +228,79 @@ def game_result():
 
 
 def compute_log_prob(model, tokenizer, prompt, action, device):
-    """Recompute log prob of action given prompt, WITH gradient tracking."""
-    # full_text  = prompt + "\n" + action
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    prompt_ids = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1216,
+    ).input_ids.to(device)
+
     action_ids = tokenizer(
         action,
         add_special_tokens=False,
         return_tensors="pt",
     ).input_ids.to(device)
 
-    prompt_len = prompt_ids.shape[1]
-
-    # Forward pass WITH gradient tracking (no torch.no_grad here)
     outputs = model(prompt_ids)
-    logits  = outputs.logits[:, -1, :]   # [1, vocab_size] — last token only
+    logits  = outputs.logits[:, -1, :].clone()  # ← clone to detach from outputs
+    del outputs                                  # ← free immediately after clone
+    torch.cuda.empty_cache()
 
-    # Only compute loss over action tokens, not prompt tokens
     log_probs_vocab = torch.nn.functional.log_softmax(logits, dim=-1)
-    token_log_probs = log_probs_vocab[0, action_ids[0]]  # [action_len]
+    token_log_probs = log_probs_vocab[0, action_ids[0]]
 
-    return token_log_probs.mean()
+    result = token_log_probs.mean()
+
+    del logits, log_probs_vocab, token_log_probs, prompt_ids, action_ids
+
+    return result
+
+
+def _compute_feeding_reward(state: dict, prev_food: int, game_count: int) -> float:
+    """
+    Reward the bot for gathering food (fish + wheat) toward feeding all workers.
+
+    Logic:
+      - food needed  = number of workers placed this round
+      - food gained  = food now minus food at start of last turn
+      - reward ramps up as food approaches the workers threshold
+      - no reward once food exceeds workers (already safe — no point hoarding)
+      - fades to zero linearly between game 200 and game 300
+    """
+    # Fade schedule: full reward 0-200 games, linear decay 200-300, zero after 300
+    if game_count >= 300:
+        return 0.0
+    fade = 1.0 if game_count < 200 else (300 - game_count) / 100.0
+
+    # Read current food and workers from player state
+    resources     = state.get("resources", {})
+    fish_now      = resources.get("fish", 0)
+    wheat_now     = resources.get("wheat", 0)
+    food_now      = fish_now + wheat_now
+
+    food_needed = state.get("totalWorkers", 5)
+
+    if food_needed == 0:
+        return 0.0   # no workers placed yet — nothing to feed
+
+    # Already overfed — no reward for hoarding beyond what's needed
+    if prev_food >= food_needed:
+        return 0.0
+
+    # Reward = how much of the gap we closed this turn
+    # gap_before: how short we were before this action
+    food_gained = max(0, food_now - prev_food)
+    gap_before = max(0, food_needed - prev_food)
+    gap_closed = min(food_gained, gap_before)   # can't close more than existed
+
+    # Scale: closing the last gap (e.g. 1→2 when need 2) is more valuable
+    # than the first point (0→1 when need 5) — sigmoid-style scaling
+    completion_ratio = (food_now / food_needed)
+    importance = min(1.0, completion_ratio)   # 0.0 → 1.0 as food fills up
+
+    feeding_reward = gap_closed * importance * fade
+
+    return feeding_reward
 
 
 def _write_stats_checkpoint(up_to_game: int):
@@ -271,39 +360,33 @@ def _rl_update(episodes_data, model, tokenizer):
     #     returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
     device = next(bot.model.parameters()).device
-    optimizer.zero_grad()
-    total_loss = torch.tensor(0.0, device=device)
+    total_loss_val = 0.0
 
-    for action_str, G in zip(actions, returns):
-        # Tokenize action only — very short, fits easily
-        action_ids = tokenizer(
-            action_str,
-            add_special_tokens=False,
-            return_tensors="pt"
-        ).input_ids.to(device)
+    for action_data, G in zip(actions, returns):
+        optimizer.zero_grad()
 
-        # Forward pass on action tokens only
-        outputs = model(action_ids)
-        logits = outputs.logits[:, :-1, :]  # [1, len-1, vocab]
-        targets = action_ids[:, 1:]  # [1, len-1]
+        token_lp = compute_log_prob(
+            model     = model,
+            tokenizer = tokenizer,
+            prompt    = action_data["prompt"],
+            action    = action_data["action"],
+            device    = device,
+        )
+        token_lp = torch.clamp(token_lp, min=-2.0, max=0.0)
 
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        token_lp = log_probs[0, range(targets.shape[1]), targets[0]].mean()
+        loss = -G * token_lp / len(actions)
+        loss.backward()
 
-        total_loss = total_loss + (-G * token_lp)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.3)
+        optimizer.step()
 
-        # Free immediately after each action
-        del outputs, logits, log_probs, action_ids, targets
-        torch.cuda.empty_cache()
-
-    total_loss = total_loss / len(actions)
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
+        total_loss_val += loss.item()
+        del token_lp, loss
+    torch.cuda.empty_cache()
 
     print(f"RL update: {len(actions)} actions | "
           f"mean_return={returns.mean():.3f} | "
-          f"loss={total_loss.item():.4f}")
+          f"loss={total_loss_val:.4f}")
 
 
 if __name__ == "__main__":
