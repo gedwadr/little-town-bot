@@ -1,6 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
+from transformers import BitsAndBytesConfig
 
 
 class BotV1:
@@ -9,13 +10,17 @@ class BotV1:
         self.adapter_path = adapter_path
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,  # 8bit instead of 16bit — saves ~1.5GB
+        )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.float16,
+            quantization_config=bnb_config,
             device_map="auto"
         )
         self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
-        self.model.eval()
+        self.model.train()
 
     def get_actions(self, system_prompt: str, user_prompt: str) -> str:
         messages = [
