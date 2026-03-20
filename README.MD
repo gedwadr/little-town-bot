@@ -4,6 +4,8 @@
 
 A competitive AI bot for the worker-placement board game [Little Town](https://iellogames.com/games/little-town/), built entirely in PyTorch — from raw game logs to a deployed, quantised model that plays in real time.
 
+![Bot playing Little Town](video/botPlay.gif)
+
 ---
 
 ## Pipeline Overview
@@ -229,13 +231,13 @@ These behaviours emerged through training, not explicit programming:
 
 ## Benchmark
 
-| | NN Bot | Heuristic Bot |
-|--|--------|--------------|
-| Inference | ~0.1s/move | 35s+/move |
+| | NN Bot | Heuristic Bot               |
+|--|--------|-----------------------------|
+| Inference | ~0.1s/move | 10s+/move                    |
 | Method | Neural forward pass | Tree search (7,000+ combos) |
-| Avg game duration | ~60s | 210s+ |
-| GPU at inference | No (INT8 CPU) | No |
-| Win rate vs RL bot (early) | ~15% | ~85% |
+| Avg game duration | ~60s | 210s+                       |
+| GPU at inference | No (INT8 CPU) | No                          |
+| Win rate vs RL bot (early) | ~15% | ~85%                        |
 
 The heuristic is the stronger player — full evaluation against it is the next planned experiment after ensemble SFT completes.
 
