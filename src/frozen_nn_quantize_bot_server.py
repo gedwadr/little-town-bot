@@ -1,21 +1,21 @@
 """
-frozen_nn_bot_server.py
-=======================
-Read-only bot server supporting three model modes. No RL updates.
+frozen_nn_quantize_bot_server.py
+=================================
+Read-only bot server that loads a pre-quantized INT8 model (produced by
+train_nn_bot_server.py every 10 games as game_N_int8.pt).
 
-Select mode via BOT_MODE env var (default: resnet).
-  resnet   — BoardGameBot (flat ResNet encoder)
-  cnn      — BoardCNNBot  (CNN board encoder + MLP global encoder)
-  ensemble — EnsembleBot  (ResNet + CNN, score-level fusion)
-
-Loads the SFT checkpoint first, then overlays an RL checkpoint on top
-if one is specified via the RL_CHECKPOINT env var or the default path.
+Runs entirely on CPU — no CUDA required. The model was saved with
+torch.quantization.quantize_dynamic so nn.Linear weights are INT8;
+no conversion step is needed here, just load and eval.
 
 Endpoints:
-  POST /get-move      — pick an action (inference only)
+  POST /get-move      — pick an action (greedy argmax, CPU inference)
   POST /game-result   — log result, no weight update
 
-Port: 9002
+Set QUANTIZED_CHECKPOINT env var to point at the int8 checkpoint file.
+Default: ./nn_rl_all_checkpoints/ensemble/v2/game_940_int8.pt
+
+Port: 9003
 """
 
 import json
@@ -27,95 +27,39 @@ from datetime import datetime
 
 from flask import Flask, request, jsonify
 
-from src.SFT.res_net.model_components import BoardGameBot
-from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS
-from src.SFT.cnn.model_components import BoardCNNBot
-from src.SFT.ensemble.ensemble_model import EnsembleBot
 from src.games.game_parser_nn import GameParserNN
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_MODE = os.environ.get("BOT_MODE", "resnet").lower()
-assert BOT_MODE in ("resnet", "cnn", "ensemble"), f"Unknown BOT_MODE: {BOT_MODE}"
-
-RESNET_CHECKPOINT_PATH   = os.environ.get("RESNET_CHECKPOINT",   "./ensemble_checkpoints/best_resnet.pt")
-CNN_CHECKPOINT_PATH      = os.environ.get("CNN_CHECKPOINT",      "./ensemble_checkpoints/best_cnn.pt")
-ENSEMBLE_CHECKPOINT_PATH = os.environ.get("ENSEMBLE_CHECKPOINT", "./ensemble_checkpoints/best.pt")
-RL_CHECKPOINT_PATH       = os.environ.get("RL_CHECKPOINT",       "./nn_rl_all_checkpoints/ensemble/v2/game_940.pt")
-
-STATS_FILE = "./stats/frozen_nn_training_stats.jsonl"
-MOVE_FILE  = "./stats/frozen_nn_move_records.jsonl"
+QUANTIZED_CHECKPOINT = os.environ.get(
+    "QUANTIZED_CHECKPOINT",
+    "./nn_rl_all_checkpoints/ensemble/v2/game_940_int8.pt",
+)
+STATS_FILE = "./stats/frozen_quantize_nn_training_stats.jsonl"
+MOVE_FILE  = "./stats/frozen_quantize_nn_move_records.jsonl"
 
 os.makedirs("./stats", exist_ok=True)
 
-# ── Model (frozen — eval mode, no optimizer) ──────────────────────────────────
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}  |  BOT_MODE: {BOT_MODE}")
+# ── Model (CPU-only, INT8) ────────────────────────────────────────────────────
+device = torch.device("cpu")
+print(f"Device: {device}  |  Quantized checkpoint: {QUANTIZED_CHECKPOINT}")
 
-
-def _load_submodel(cls, path, label, **kwargs):
-    m = cls(**kwargs)
-    if os.path.exists(path):
-        ckpt = torch.load(path, map_location="cpu")
-        try:
-            m.load_state_dict(ckpt["state_dict"])
-            print(f"Loaded {label} from {path} "
-                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
-        except RuntimeError as e:
-            print(f"[WARN] {label} checkpoint incompatible, ignoring: {e}")
-    else:
-        print(f"[WARN] No {label} checkpoint at {path} — using random weights")
-    return m
-
-
-if BOT_MODE == "resnet":
-    model = _load_submodel(
-        BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet",
-        state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
-    ).to(device)
-
-elif BOT_MODE == "cnn":
-    model = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
-
-else:  # ensemble
-    resnet = _load_submodel(
-        BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet (ensemble)",
-        state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
+if not os.path.exists(QUANTIZED_CHECKPOINT):
+    raise FileNotFoundError(
+        f"Quantized checkpoint not found: {QUANTIZED_CHECKPOINT}\n"
+        f"Run train_nn_bot_server.py first to generate int8 checkpoints."
     )
-    cnn = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
 
-    if os.path.exists(ENSEMBLE_CHECKPOINT_PATH):
-        ckpt = torch.load(ENSEMBLE_CHECKPOINT_PATH, map_location="cpu")
-        model = EnsembleBot(resnet, cnn, learnable_weights=True)
-        try:
-            model.load_state_dict(ckpt["state_dict"])
-            w = ckpt.get("weights", [0.5, 0.5])
-            print(f"Loaded ensemble from {ENSEMBLE_CHECKPOINT_PATH} "
-                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')}, "
-                  f"w=[{w[0]:.3f},{w[1]:.3f}])")
-        except RuntimeError as e:
-            print(f"[WARN] Ensemble checkpoint incompatible, ignoring: {e}")
-        model = model.to(device)
-    else:
-        print(f"[WARN] No ensemble checkpoint at {ENSEMBLE_CHECKPOINT_PATH} — fusing sub-models with equal weights")
-        model = EnsembleBot(resnet, cnn, learnable_weights=False).to(device)
+ckpt  = torch.load(QUANTIZED_CHECKPOINT, map_location="cpu", weights_only=False)
+model = ckpt["model"]
+model.eval()
 
-# Overlay RL checkpoint if available (works for any mode)
-if os.path.exists(RL_CHECKPOINT_PATH):
-    rl_ckpt = torch.load(RL_CHECKPOINT_PATH, map_location=device)
-    try:
-        model.load_state_dict(rl_ckpt["state_dict"])
-        print(f"Loaded RL checkpoint: {RL_CHECKPOINT_PATH} "
-              f"(game={rl_ckpt.get('game','?')})")
-    except RuntimeError as e:
-        print(f"[WARN] RL checkpoint incompatible (arch mismatch?), ignoring: {e}")
-else:
-    print(f"[INFO] No RL checkpoint at {RL_CHECKPOINT_PATH} — using SFT weights only")
-
-model.eval()  # frozen: no dropout, no gradient tracking
+bot_mode = ckpt.get("bot_mode", "unknown")
+print(f"Loaded INT8 model from {QUANTIZED_CHECKPOINT}  "
+      f"(game={ckpt.get('game', '?')}, bot_mode={bot_mode})")
 
 # ── Server state ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.json.sort_keys = False  # preserve key order from Majapahit server
+app.json.sort_keys = False
 game_count = 0
 game_stats: list[dict] = []
 
@@ -128,14 +72,14 @@ episodes = defaultdict(lambda: {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _select_action(state_vec: list, candidate_vecs: list):
-    """Greedy argmax — no temperature, no sampling, no gradient."""
-    state_t = torch.tensor(state_vec,      dtype=torch.float32, device=device)
-    cands_t = torch.tensor(candidate_vecs, dtype=torch.float32, device=device)
+    """Greedy argmax on CPU with the INT8 model."""
+    state_t = torch.tensor(state_vec,      dtype=torch.float32)
+    cands_t = torch.tensor(candidate_vecs, dtype=torch.float32)
 
     with torch.no_grad():
-        scores = model(state_t.unsqueeze(0), cands_t.unsqueeze(0))[0]  # [N]
-        idx    = scores.argmax().item()
-        probs  = F.softmax(scores, dim=-1)
+        scores   = model(state_t.unsqueeze(0), cands_t.unsqueeze(0))[0]  # [N]
+        idx      = scores.argmax().item()
+        probs    = F.softmax(scores, dim=-1)
         log_prob = torch.log(probs[idx] + 1e-8).item()
 
     return idx, log_prob
@@ -151,13 +95,11 @@ def get_move():
     player_id = str(data["player_id"])
     log_data  = {"log": data["log"]}
 
-    # Legal moves come directly from the Majapahit server
     candidate_dicts = data.get("moves", [])
     if not candidate_dicts:
         print(f"[{game_id}] no legal moves")
         return jsonify({"actions": [], "error": "no legal moves"})
 
-    # Build state vector and encode each candidate action
     parser         = GameParserNN.from_live_data(log_data)
     state_vec      = parser.build_state_vector(player_id)
     candidate_vecs = [parser.encode_action(m, player_id) for m in candidate_dicts]
@@ -247,4 +189,4 @@ def _write_stats_checkpoint(up_to_game: int):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(port=9002)
+    app.run(port=9003)

@@ -6,7 +6,7 @@ import os
 import httpx
 
 BASE_URL = os.environ["BASE_URL"]
-OUTPUT_DIR = Path("./logs/matchLogs")
+OUTPUT_DIR = Path("./logs/local/matchLogs/2p/v2")
 MAX_PAGES = 100
 CONCURRENCY = 10  # simultaneous match-detail requests
 

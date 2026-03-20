@@ -270,7 +270,6 @@ class GameParserNN(GameParser):
         self.flush()
 
         # ── Build weight map: player_id → training weight ──────
-        NAMED_PLAYERS = {"greg", "lin", "olin", "oline"}
         POSITION_WEIGHTS = {
             2: [1.0, 0.1],
             3: [1.0, 0.5, 0.1],
@@ -287,9 +286,6 @@ class GameParserNN(GameParser):
         weight_map: dict[str, float] = {}
         for i, pid in enumerate(ranked):
             w = pos_weights[i] if i < len(pos_weights) else 0.1
-            name = self.player_names.get(pid, "").strip().lower()
-            if name in NAMED_PLAYERS:
-                w = 1.1
             weight_map[pid] = w
 
         replay = GameParserNN(
