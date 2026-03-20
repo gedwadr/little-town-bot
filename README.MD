@@ -125,7 +125,7 @@ Online policy-gradient training that runs during live games.
 ### Server
 
 ```bash
-python src/nn_bot_server.py   # port 9001
+python src/train_nn_bot_server.py   # port 9001
 ```
 
 For inference only (no gradients):
@@ -251,7 +251,7 @@ python src/SFT/res_net/trainer.py
 
 **3. Start the RL bot server:**
 ```bash
-python src/nn_bot_server.py
+python src/train_nn_bot_server.py
 ```
 
 **4. Start the frozen inference server (for opponents/evaluation):**

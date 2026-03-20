@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS
+from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS, DROPOUT
 
 
 class ResBlock(nn.Module):
@@ -22,13 +22,13 @@ class ResBlock(nn.Module):
     than post-activation for small networks.
     """
 
-    def __init__(self, dim: int, dropout: float = 0.35):
+    def __init__(self, dim: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(DROPOUT),
             nn.Linear(dim, dim),
         )
 
@@ -42,20 +42,19 @@ class GameStateEncoder(nn.Module):
     Runs ONCE per turn regardless of how many candidates there are.
     """
 
-    def __init__(self, state_dim: int, hidden_dim: int, n_blocks: int,
-                 dropout: float = 0.35):
+    def __init__(self, state_dim: int, hidden_dim: int, n_blocks: int):
         super().__init__()
 
         # Project raw features into hidden space
         self.input_proj = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Dropout(DROPOUT)
         )
 
         # Stack of residual blocks
         self.blocks = nn.ModuleList([
-            ResBlock(hidden_dim, dropout) for _ in range(n_blocks)
+            ResBlock(hidden_dim) for _ in range(n_blocks)
         ])
 
         self.output_norm = nn.LayerNorm(hidden_dim)
@@ -78,7 +77,7 @@ class ActionScorer(nn.Module):
     Output is always a single scalar per candidate.
     """
 
-    def __init__(self, hidden_dim: int, action_dim: int, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, action_dim: int):
         super().__init__()
         in_dim = hidden_dim + action_dim  # concat state emb + action vector
 
@@ -86,7 +85,7 @@ class ActionScorer(nn.Module):
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, 64),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(DROPOUT),
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
@@ -128,11 +127,10 @@ class BoardGameBot(nn.Module):
     def __init__(self, state_dim: int = STATE_DIM,
                  action_dim: int = ACTION_DIM,
                  hidden_dim: int = HIDDEN_DIM,
-                 n_blocks: int = N_BLOCKS,
-                 dropout: float = 0.1):
+                 n_blocks: int = N_BLOCKS):
         super().__init__()
-        self.encoder = GameStateEncoder(state_dim, hidden_dim, n_blocks, dropout)
-        self.scorer = ActionScorer(hidden_dim, action_dim, dropout)
+        self.encoder = GameStateEncoder(state_dim, hidden_dim, n_blocks)
+        self.scorer = ActionScorer(hidden_dim, action_dim)
 
     def forward(self, state: torch.Tensor,
                 candidates: torch.Tensor) -> torch.Tensor:

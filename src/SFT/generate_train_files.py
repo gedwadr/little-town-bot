@@ -7,7 +7,7 @@ from src.games.game_parser_nn import GameParserNN
 
 
 def parse_folder(folder: str, winner_only: bool = False, verbose: bool = False,
-                 nn: bool = False) -> list:
+                 nn: bool = False, players: list = None) -> list:
     """Parse all game files in a folder into training examples."""
     all_examples = []
     paths = sorted(
@@ -16,6 +16,10 @@ def parse_folder(folder: str, winner_only: bool = False, verbose: bool = False,
     for p in paths:
         try:
             parser = GameParser.from_file(str(p), parser_cls=GameParserNN if nn else None)
+            if players and len(parser.player_ids) not in players:
+                if verbose:
+                    print(f"  [SKIP] {p.name}: {len(parser.player_ids)}-player game")
+                continue
             if nn:
                 examples = parser.extract_nn_training_examples(winner_only=winner_only)
             else:
@@ -100,15 +104,21 @@ def main():
                     help="Include candidate placement previews in prompts (SFT only)")
     ap.add_argument("--nn",                action="store_true",
                     help="Generate numerical NN training data instead of SFT text data")
+    ap.add_argument("--players",           type=int, nargs="+", choices=[2, 3, 4],
+                    metavar="{2,3,4}",
+                    help="Only include games with these player counts (e.g. --players 2 4)")
     args = ap.parse_args()
 
     import os
     if os.path.isdir(args.input):
         examples = parse_folder(args.input, winner_only=args.winner_only,
-                                verbose=args.verbose, nn=args.nn)
+                                verbose=args.verbose, nn=args.nn, players=args.players)
     else:
         parser = GameParser.from_file(args.input, parser_cls=GameParserNN if args.nn else None)
-        if args.nn:
+        if args.players and len(parser.player_ids) not in args.players:
+            print(f"Skipped: {len(parser.player_ids)}-player game not in --players {args.players}")
+            examples = []
+        elif args.nn:
             examples = parser.extract_nn_training_examples(winner_only=args.winner_only)
         else:
             examples = parser.extract_training_examples(winner_only=args.winner_only)

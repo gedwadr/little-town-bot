@@ -1,7 +1,12 @@
 """
 frozen_nn_bot_server.py
 =======================
-Read-only bot server using BoardGameBot (ResNet). No RL updates.
+Read-only bot server supporting three model modes. No RL updates.
+
+Select mode via BOT_MODE env var (default: resnet).
+  resnet   — BoardGameBot (flat ResNet encoder)
+  cnn      — BoardCNNBot  (CNN board encoder + MLP global encoder)
+  ensemble — EnsembleBot  (ResNet + CNN, score-level fusion)
 
 Loads the SFT checkpoint first, then overlays an RL checkpoint on top
 if one is specified via the RL_CHECKPOINT env var or the default path.
@@ -24,13 +29,18 @@ from flask import Flask, request, jsonify
 
 from src.SFT.res_net.model_components import BoardGameBot
 from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS
+from src.SFT.cnn.model_components import BoardCNNBot
+from src.SFT.ensemble.ensemble_model import EnsembleBot
 from src.games.game_parser_nn import GameParserNN
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-# Base SFT checkpoint
-SFT_CHECKPOINT_PATH = "./nn_all_checkpoints/best.pt"
-# Optional RL checkpoint to overlay (overrides SFT weights if present)
-RL_CHECKPOINT_PATH  = os.environ.get("RL_CHECKPOINT", "./nn_rl_all_checkpoints/heurystic/3p/v1/game_240.pt")
+# ── Config ────────────────────────────────────────────────────────────────────
+BOT_MODE = os.environ.get("BOT_MODE", "resnet").lower()
+assert BOT_MODE in ("resnet", "cnn", "ensemble"), f"Unknown BOT_MODE: {BOT_MODE}"
+
+RESNET_CHECKPOINT_PATH   = os.environ.get("RESNET_CHECKPOINT",   "./ensemble_checkpoints/v3/best_resnet.pt")
+CNN_CHECKPOINT_PATH      = os.environ.get("CNN_CHECKPOINT",      "./ensemble_checkpoints/v3/best_cnn.pt")
+ENSEMBLE_CHECKPOINT_PATH = os.environ.get("ENSEMBLE_CHECKPOINT", "./ensemble_checkpoints/v3/best.pt")
+RL_CHECKPOINT_PATH       = os.environ.get("RL_CHECKPOINT",       "")
 
 STATS_FILE = "./stats/frozen_nn_training_stats.jsonl"
 MOVE_FILE  = "./stats/frozen_nn_move_records.jsonl"
@@ -39,30 +49,65 @@ os.makedirs("./stats", exist_ok=True)
 
 # ── Model (frozen — eval mode, no optimizer) ──────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
+print(f"Device: {device}  |  BOT_MODE: {BOT_MODE}")
 
-model = BoardGameBot(
-    state_dim=STATE_DIM,
-    action_dim=ACTION_DIM,
-    hidden_dim=HIDDEN_DIM,
-    n_blocks=N_BLOCKS,
-).to(device)
 
-# Load SFT base weights
-if os.path.exists(SFT_CHECKPOINT_PATH):
-    ckpt = torch.load(SFT_CHECKPOINT_PATH, map_location=device)
-    model.load_state_dict(ckpt["state_dict"])
-    print(f"Loaded SFT checkpoint: {SFT_CHECKPOINT_PATH} "
-          f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
-else:
-    print(f"[WARN] No SFT checkpoint at {SFT_CHECKPOINT_PATH} — starting from random weights")
+def _load_submodel(cls, path, label, **kwargs):
+    m = cls(**kwargs)
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location="cpu")
+        try:
+            m.load_state_dict(ckpt["state_dict"])
+            print(f"Loaded {label} from {path} "
+                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
+        except RuntimeError as e:
+            print(f"[WARN] {label} checkpoint incompatible, ignoring: {e}")
+    else:
+        print(f"[WARN] No {label} checkpoint at {path} — using random weights")
+    return m
 
-# Overlay RL checkpoint if available
+
+if BOT_MODE == "resnet":
+    model = _load_submodel(
+        BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet",
+        state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
+    ).to(device)
+
+elif BOT_MODE == "cnn":
+    model = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
+
+else:  # ensemble
+    resnet = _load_submodel(
+        BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet (ensemble)",
+        state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
+    )
+    cnn = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
+
+    if os.path.exists(ENSEMBLE_CHECKPOINT_PATH):
+        ckpt = torch.load(ENSEMBLE_CHECKPOINT_PATH, map_location="cpu")
+        model = EnsembleBot(resnet, cnn, learnable_weights=True)
+        try:
+            model.load_state_dict(ckpt["state_dict"])
+            w = ckpt.get("weights", [0.5, 0.5])
+            print(f"Loaded ensemble from {ENSEMBLE_CHECKPOINT_PATH} "
+                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')}, "
+                  f"w=[{w[0]:.3f},{w[1]:.3f}])")
+        except RuntimeError as e:
+            print(f"[WARN] Ensemble checkpoint incompatible, ignoring: {e}")
+        model = model.to(device)
+    else:
+        print(f"[WARN] No ensemble checkpoint at {ENSEMBLE_CHECKPOINT_PATH} — fusing sub-models with equal weights")
+        model = EnsembleBot(resnet, cnn, learnable_weights=False).to(device)
+
+# Overlay RL checkpoint if available (works for any mode)
 if os.path.exists(RL_CHECKPOINT_PATH):
     rl_ckpt = torch.load(RL_CHECKPOINT_PATH, map_location=device)
-    model.load_state_dict(rl_ckpt["state_dict"])
-    print(f"Loaded RL checkpoint: {RL_CHECKPOINT_PATH} "
-          f"(game={rl_ckpt.get('game','?')})")
+    try:
+        model.load_state_dict(rl_ckpt["state_dict"])
+        print(f"Loaded RL checkpoint: {RL_CHECKPOINT_PATH} "
+              f"(game={rl_ckpt.get('game','?')})")
+    except RuntimeError as e:
+        print(f"[WARN] RL checkpoint incompatible (arch mismatch?), ignoring: {e}")
 else:
     print(f"[INFO] No RL checkpoint at {RL_CHECKPOINT_PATH} — using SFT weights only")
 

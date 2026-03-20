@@ -1,9 +1,14 @@
 """
-nn_bot_server.py
+train_nn_bot_server.py
 ================
-Flask bot server using BoardGameBot (ResNet) instead of the LLM.
+Flask bot server supporting three model modes:
+  resnet   — BoardGameBot (flat ResNet encoder)
+  cnn      — BoardCNNBot  (CNN board encoder + MLP global encoder)
+  ensemble — EnsembleBot  (ResNet + CNN, score-level fusion)
 
-Endpoints mirror bot_server.py:
+Select mode via BOT_MODE env var (default: resnet).
+
+Endpoints:
   POST /get-move      — pick an action, record (state, candidates, chosen_idx)
   POST /game-result   — run REINFORCE update, save checkpoint
 
@@ -14,6 +19,8 @@ RL loop:
 
 import json
 import os
+
+import requests
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
@@ -23,41 +30,94 @@ from flask import Flask, request, jsonify
 
 from src.SFT.res_net.model_components import BoardGameBot
 from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS
+from src.SFT.cnn.model_components import BoardCNNBot
+from src.SFT.ensemble.ensemble_model import EnsembleBot
 from src.games.game_parser_nn import GameParserNN
+import random
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-CHECKPOINT_PATH = "./nn_all_checkpoints/best.pt"
-RL_CHECKPOINT_DIR = "./nn_rl_all_checkpoints/heurystic/4p/v1"
-RL_CHECKPOINT_PATH  = os.environ.get("RL_CHECKPOINT", "./nn_rl_all_checkpoints/heurystic/3p/v1/game_240.pt")
+# ── Config ────────────────────────────────────────────────────────────────────
+BOT_MODE = os.environ.get("BOT_MODE", "resnet").lower()  # resnet | cnn | ensemble
+assert BOT_MODE in ("resnet", "cnn", "ensemble"), f"Unknown BOT_MODE: {BOT_MODE}"
+
+RESNET_CHECKPOINT_PATH   = os.environ.get("RESNET_CHECKPOINT",   "./ensemble_checkpoints/best_resnet.pt")
+CNN_CHECKPOINT_PATH      = os.environ.get("CNN_CHECKPOINT",      "./ensemble_checkpoints/best_cnn.pt")
+ENSEMBLE_CHECKPOINT_PATH = os.environ.get("ENSEMBLE_CHECKPOINT", "./ensemble_checkpoints/best.pt")
+RL_CHECKPOINT_DIR      = f"./nn_rl_all_checkpoints/{BOT_MODE}/v2"
+RL_CHECKPOINT_PATH     = os.environ.get("RL_CHECKPOINT", f"")
 STATS_FILE = "./stats/nn_training_stats.jsonl"
-MOVE_FILE = "./stats/nn_move_records.jsonl"
 
 os.makedirs(RL_CHECKPOINT_DIR, exist_ok=True)
 os.makedirs("./stats", exist_ok=True)
 
+## continous game
+URL = "http://localhost:8000/api/bot-match"
+payload = {
+    "numPlayers": 2,
+    "boardSide": random.choice(["A", "B"]),
+    "randomizeTurnOrder": True,
+    # "cpuSearchProfile": "extreme",
+    "bots": [
+        {"playerID": "0", "serviceUrl": "http://localhost:9002", "botName": "Freeze-Ensemble-RL"},
+        {"playerID": "1", "serviceUrl": "http://localhost:9001", "botName": "Ensemble-RL"},
+    ],
+}
+
 # ── Model ─────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {device}")
+print(f"Device: {device}  |  BOT_MODE: {BOT_MODE}")
 
-model = BoardGameBot(
-    state_dim=STATE_DIM,
-    action_dim=ACTION_DIM,
-    hidden_dim=HIDDEN_DIM,
-    n_blocks=N_BLOCKS,
-).to(device)
 
-if os.path.exists(CHECKPOINT_PATH):
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
-    try:
-        model.load_state_dict(ckpt["state_dict"])
-        print(f"Loaded checkpoint from {CHECKPOINT_PATH} "
-              f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc', '?')})")
-    except RuntimeError as e:
-        print(f"[WARN] Checkpoint incompatible (arch changed?), ignoring: {e}")
-else:
-    print(f"[WARN] No checkpoint at {CHECKPOINT_PATH} — starting from random weights")
+def _load_submodel(cls, path, label, **kwargs):
+    """Instantiate cls, load checkpoint if it exists, return model (cpu)."""
+    m = cls(**kwargs)
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location="cpu")
+        try:
+            m.load_state_dict(ckpt["state_dict"])
+            print(f"Loaded {label} from {path} "
+                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
+        except RuntimeError as e:
+            print(f"[WARN] {label} checkpoint incompatible, ignoring: {e}")
+    else:
+        print(f"[WARN] No {label} checkpoint at {path} — using random weights")
+    return m
 
-if os.path.exists(RL_CHECKPOINT_PATH):
+
+if BOT_MODE == "resnet":
+    model = _load_submodel(
+        BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet",
+        state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
+    ).to(device)
+
+elif BOT_MODE == "cnn":
+    model = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
+
+else:  # ensemble
+    resnet = _load_submodel(
+        BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet (ensemble)",
+        state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
+    )
+    cnn = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
+
+    if os.path.exists(ENSEMBLE_CHECKPOINT_PATH):
+        # Load full jointly-trained ensemble (learnable fusion weights)
+        ckpt = torch.load(ENSEMBLE_CHECKPOINT_PATH, map_location="cpu")
+        model = EnsembleBot(resnet, cnn, learnable_weights=True)
+        try:
+            model.load_state_dict(ckpt["state_dict"])
+            w = ckpt.get("weights", [0.5, 0.5])
+            print(f"Loaded ensemble from {ENSEMBLE_CHECKPOINT_PATH} "
+                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')}, "
+                  f"w=[{w[0]:.3f},{w[1]:.3f}])")
+        except RuntimeError as e:
+            print(f"[WARN] Ensemble checkpoint incompatible, ignoring: {e}")
+        model = model.to(device)
+    else:
+        print(f"[WARN] No ensemble checkpoint at {ENSEMBLE_CHECKPOINT_PATH} — fusing sub-models with equal weights")
+        model = EnsembleBot(resnet, cnn, learnable_weights=False).to(device)
+
+# Optionally resume from an RL checkpoint (any mode)
+if RL_CHECKPOINT_PATH and os.path.exists(RL_CHECKPOINT_PATH):
     rl_ckpt = torch.load(RL_CHECKPOINT_PATH, map_location=device)
     try:
         model.load_state_dict(rl_ckpt["state_dict"])
@@ -65,8 +125,6 @@ if os.path.exists(RL_CHECKPOINT_PATH):
               f"(game={rl_ckpt.get('game','?')})")
     except RuntimeError as e:
         print(f"[WARN] RL checkpoint incompatible (arch changed?), ignoring: {e}")
-else:
-    print(f"[INFO] No RL checkpoint at {RL_CHECKPOINT_PATH} — using SFT weights only")
 
 model.eval()  # dropout off during inference; switched to train() only inside _rl_update
 
@@ -152,16 +210,16 @@ def get_move():
     ep["steps"].append((state_vec, candidate_vecs, chosen_idx))
     ep["vp_at_last_turn"] = vp_now
 
-    # Log
-    with open(MOVE_FILE, "a") as f:
-        f.write(json.dumps({
-            "game_id":          game_id,
-            "player_id":        player_id,
-            "n_candidates":     len(candidate_dicts),
-            "chosen_idx":       chosen_idx,
-            "log_prob":         round(log_prob, 4),
-            "chosen_move":      majapahit_action["move"],
-        }) + "\n")
+    # # Log
+    # with open(MOVE_FILE, "a") as f:
+    #     f.write(json.dumps({
+    #         "game_id":          game_id,
+    #         "player_id":        player_id,
+    #         "n_candidates":     len(candidate_dicts),
+    #         "chosen_idx":       chosen_idx,
+    #         "log_prob":         round(log_prob, 4),
+    #         "chosen_move":      majapahit_action["move"],
+    #     }) + "\n")
 
     return jsonify({"actions": [majapahit_action]})
 
@@ -183,7 +241,7 @@ def game_result():
     # Settle last step reward (end-game VP delta)
     vp_at_last_turn    = ep.get("vp_at_last_turn", final_vp)
     last_turn_vp_delta = final_vp - vp_at_last_turn
-    last_step_reward   = last_turn_vp_delta * 0.1 + 0.02
+    last_step_reward   = last_turn_vp_delta * 0.1
     ep["rewards"].append(last_step_reward)
 
     # Final placement bonus
@@ -198,10 +256,7 @@ def game_result():
     print(f"Game {game_id} ended | position={position}/{n_players} | "
           f"final_vp={final_vp} | rewards={ep['rewards']}")
 
-    if position == 1:
-        _rl_update(ep)
-    else:
-        print("not updating RL")
+    _rl_update(ep)
     game_count += 1
 
     game_stats.append({
@@ -214,13 +269,22 @@ def game_result():
 
     if game_count % 10 == 0:
         ckpt_path = f"{RL_CHECKPOINT_DIR}/game_{game_count}.pt"
-        torch.save({"game": game_count, "state_dict": model.state_dict()}, ckpt_path)
+        torch.save({"game": game_count, "bot_mode": BOT_MODE, "state_dict": model.state_dict()}, ckpt_path)
         print(f"Saved RL checkpoint: {ckpt_path}")
 
     if game_count % 10 == 0:
         _write_stats_checkpoint(game_count)
 
     del episodes[game_id]
+
+    try:
+        res = requests.post(URL, json=payload, timeout=10)
+        data = res.json()
+        print(f"[cron] match started: {data}")
+    except Exception as e:
+        print(f"[cron] error: {e}")
+
+
     return jsonify({"status": "updated", "position": position})
 
 
@@ -230,7 +294,10 @@ def _rl_update(ep: dict):
     """REINFORCE update on model weights."""
     steps   = ep["steps"]    # list of (state_vec, candidate_vecs, chosen_idx)
     rewards = ep["rewards"]
-
+    for i in range(len(rewards)):
+        if i != len(rewards) - 1:
+            rewards[i] = rewards[-1] / 2
+    print(rewards)
     if not steps or not rewards:
         print("No steps or rewards — skipping RL update")
         return
