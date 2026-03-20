@@ -17,12 +17,14 @@ RL loop:
   - On game end: compute discounted returns, one backward per step
 """
 
+import copy
 import json
 import os
 
 import requests
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler
 from collections import defaultdict
 from datetime import datetime
 
@@ -39,10 +41,10 @@ import random
 BOT_MODE = os.environ.get("BOT_MODE", "resnet").lower()  # resnet | cnn | ensemble
 assert BOT_MODE in ("resnet", "cnn", "ensemble"), f"Unknown BOT_MODE: {BOT_MODE}"
 
-RESNET_CHECKPOINT_PATH   = os.environ.get("RESNET_CHECKPOINT",   "./ensemble_checkpoints/best_resnet.pt")
-CNN_CHECKPOINT_PATH      = os.environ.get("CNN_CHECKPOINT",      "./ensemble_checkpoints/best_cnn.pt")
-ENSEMBLE_CHECKPOINT_PATH = os.environ.get("ENSEMBLE_CHECKPOINT", "./ensemble_checkpoints/best.pt")
-RL_CHECKPOINT_DIR      = f"./nn_rl_all_checkpoints/{BOT_MODE}/v2"
+RESNET_CHECKPOINT_PATH   = os.environ.get("RESNET_CHECKPOINT",   "./ensemble_checkpoints/v3/best_resnet.pt")
+CNN_CHECKPOINT_PATH      = os.environ.get("CNN_CHECKPOINT",      "./ensemble_checkpoints/v3/best_cnn.pt")
+ENSEMBLE_CHECKPOINT_PATH = os.environ.get("ENSEMBLE_CHECKPOINT", "./ensemble_checkpoints/v3/best.pt")
+RL_CHECKPOINT_DIR      = f"./nn_rl_all_checkpoints/{BOT_MODE}/v3"
 RL_CHECKPOINT_PATH     = os.environ.get("RL_CHECKPOINT", f"")
 STATS_FILE = "./stats/nn_training_stats.jsonl"
 
@@ -55,9 +57,9 @@ payload = {
     "numPlayers": 2,
     "boardSide": random.choice(["A", "B"]),
     "randomizeTurnOrder": True,
-    # "cpuSearchProfile": "extreme",
+    "cpuSearchProfile": "extreme",
     "bots": [
-        {"playerID": "0", "serviceUrl": "http://localhost:9002", "botName": "Freeze-Ensemble-RL"},
+        {"playerID": "0"},
         {"playerID": "1", "serviceUrl": "http://localhost:9001", "botName": "Ensemble-RL"},
     ],
 }
@@ -129,10 +131,11 @@ if RL_CHECKPOINT_PATH and os.path.exists(RL_CHECKPOINT_PATH):
 model.eval()  # dropout off during inference; switched to train() only inside _rl_update
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-3)
+scaler = GradScaler(enabled=device.type == "cuda")
 
 # ── Server state ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.json.sort_keys = False  # preserve key order from Majapahit server (remote-bot uses JSON.stringify comparison)
+app.json.sort_keys = False
 game_count = 0
 game_stats: list[dict] = []
 
@@ -161,10 +164,10 @@ def _select_action(state_vec: list, candidate_vecs: list, temp: float):
     state_t = torch.tensor(state_vec, dtype=torch.float32, device=device)
     cands_t = torch.tensor(candidate_vecs, dtype=torch.float32, device=device)
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
         scores = model(state_t.unsqueeze(0), cands_t.unsqueeze(0))[0]
         idx = scores.argmax().item()
-        probs = F.softmax(scores, dim=-1)
+        probs = F.softmax(scores.float(), dim=-1)
         log_prob = torch.log(probs[idx] + 1e-8).item()
 
     return idx, log_prob
@@ -272,6 +275,17 @@ def game_result():
         torch.save({"game": game_count, "bot_mode": BOT_MODE, "state_dict": model.state_dict()}, ckpt_path)
         print(f"Saved RL checkpoint: {ckpt_path}")
 
+        # Save INT8 dynamically-quantized model for deployment (CPU, Linear layers only)
+        # quantize_dynamic replaces nn.Linear with DynamicQuantizedLinear, so we
+        # save the full model object rather than just the state_dict.
+        quantized_path = f"{RL_CHECKPOINT_DIR}/game_{game_count}_int8.pt"
+        cpu_copy = copy.deepcopy(model).cpu().eval()
+        int8_model = torch.quantization.quantize_dynamic(
+            cpu_copy, {torch.nn.Linear}, dtype=torch.qint8
+        )
+        torch.save({"game": game_count, "bot_mode": BOT_MODE, "model": int8_model}, quantized_path)
+        print(f"Saved INT8 quantized checkpoint: {quantized_path}")
+
     if game_count % 10 == 0:
         _write_stats_checkpoint(game_count)
 
@@ -320,19 +334,22 @@ def _rl_update(ep: dict):
     optimizer.zero_grad()
     total_loss = torch.tensor(0.0, device=device)
 
-    for (state_vec, candidate_vecs, chosen_idx), G in zip(steps, returns_t):
-        state_t = torch.tensor(state_vec, dtype=torch.float32, device=device)
-        cands_t = torch.tensor(candidate_vecs, dtype=torch.float32, device=device)
+    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+        for (state_vec, candidate_vecs, chosen_idx), G in zip(steps, returns_t):
+            state_t = torch.tensor(state_vec, dtype=torch.float32, device=device)
+            cands_t = torch.tensor(candidate_vecs, dtype=torch.float32, device=device)
 
-        scores = model(state_t.unsqueeze(0), cands_t.unsqueeze(0))[0]
-        log_prob = F.log_softmax(scores, dim=-1)[chosen_idx]
+            scores = model(state_t.unsqueeze(0), cands_t.unsqueeze(0))[0]
+            log_prob = F.log_softmax(scores.float(), dim=-1)[chosen_idx]
 
-        total_loss = total_loss + (-G * log_prob)
+            total_loss = total_loss + (-G * log_prob)
 
     total_loss = total_loss / len(steps)
-    total_loss.backward()
+    scaler.scale(total_loss).backward()
+    scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.3)
-    optimizer.step()
+    scaler.step(optimizer)
+    scaler.update()
     model.eval()
 
     print(f"Game Count: {game_count} | "
