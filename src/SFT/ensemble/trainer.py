@@ -12,15 +12,15 @@ the full ensemble from an RL checkpoint to continue fine-tuning.
 
 Usage
 -----
-    python -m src.SFT.ensemble.trainer
+    python -m src.SFT.ensemble.llm
 
     # warm-start from pretrained sub-models:
-    python -m src.SFT.ensemble.trainer \
+    python -m src.SFT.ensemble.llm \
         --resnet_ckpt nn_all_checkpoints_2p/best.pt \
         --cnn_ckpt    cnn_checkpoints_2p/best.pt
 
     # continue from RL-trained ensemble:
-    python -m src.SFT.ensemble.trainer \
+    python -m src.SFT.ensemble.llm \
         --rl_ckpt nn_rl_all_checkpoints/ensemble/game_240.pt
 """
 
