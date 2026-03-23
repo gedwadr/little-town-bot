@@ -23,7 +23,6 @@ import os
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
-from datetime import datetime
 
 from flask import Flask, request, jsonify
 
@@ -32,6 +31,7 @@ from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS
 from src.SFT.cnn.model_components import BoardCNNBot
 from src.SFT.ensemble.ensemble_model import EnsembleBot
 from src.games.game_parser_nn import GameParserNN
+from src.server_common import load_nn_submodel, write_stats_checkpoint
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_MODE = os.environ.get("BOT_MODE", "resnet").lower()
@@ -52,36 +52,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}  |  BOT_MODE: {BOT_MODE}")
 
 
-def _load_submodel(cls, path, label, **kwargs):
-    m = cls(**kwargs)
-    if os.path.exists(path):
-        ckpt = torch.load(path, map_location="cpu")
-        try:
-            m.load_state_dict(ckpt["state_dict"])
-            print(f"Loaded {label} from {path} "
-                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
-        except RuntimeError as e:
-            print(f"[WARN] {label} checkpoint incompatible, ignoring: {e}")
-    else:
-        print(f"[WARN] No {label} checkpoint at {path} — using random weights")
-    return m
-
-
 if BOT_MODE == "resnet":
-    model = _load_submodel(
+    model = load_nn_submodel(
         BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet",
         state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
     ).to(device)
 
 elif BOT_MODE == "cnn":
-    model = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
+    model = load_nn_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
 
 else:  # ensemble
-    resnet = _load_submodel(
+    resnet = load_nn_submodel(
         BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet (ensemble)",
         state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
     )
-    cnn = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
+    cnn = load_nn_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
 
     if os.path.exists(ENSEMBLE_CHECKPOINT_PATH):
         ckpt = torch.load(ENSEMBLE_CHECKPOINT_PATH, map_location="cpu")
@@ -210,38 +195,12 @@ def game_result():
     })
 
     if game_count % 10 == 0:
-        _write_stats_checkpoint(game_count)
+        write_stats_checkpoint(game_stats, STATS_FILE, game_count)
 
     if game_id in episodes:
         del episodes[game_id]
 
     return jsonify({"status": "ok", "position": position})
-
-
-# ── Stats ─────────────────────────────────────────────────────────────────────
-
-def _write_stats_checkpoint(up_to_game: int):
-    window = game_stats[-10:]
-    if not window:
-        return
-    n       = len(window)
-    wins    = sum(1 for g in window if g["won"])
-    avg_vp  = sum(g["vp"]       for g in window) / n
-    avg_dur = sum(g["duration"] for g in window) / n
-    avg_pos = sum(g["position"] for g in window) / n
-    record  = {
-        "timestamp":        datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "games_so_far":     up_to_game,
-        "window":           n,
-        "win_rate":         round(wins / n, 4),
-        "avg_position":     round(avg_pos, 2),
-        "avg_vp":           round(avg_vp, 2),
-        "avg_duration_sec": round(avg_dur, 1),
-    }
-    with open(STATS_FILE, "a") as f:
-        f.write(json.dumps(record) + "\n")
-    print(f"[stats] games={up_to_game}  win_rate={record['win_rate']:.2%}  "
-          f"avg_vp={record['avg_vp']:.1f}  avg_pos={record['avg_position']:.2f}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -23,11 +23,11 @@ import os
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
-from datetime import datetime
 
 from flask import Flask, request, jsonify
 
 from src.games.game_parser_nn import GameParserNN
+from src.server_common import write_stats_checkpoint
 
 # ── Config ────────────────────────────────────────────────────────────────────
 QUANTIZED_CHECKPOINT = os.environ.get(
@@ -152,38 +152,12 @@ def game_result():
     })
 
     if game_count % 10 == 0:
-        _write_stats_checkpoint(game_count)
+        write_stats_checkpoint(game_stats, STATS_FILE, game_count)
 
     if game_id in episodes:
         del episodes[game_id]
 
     return jsonify({"status": "ok", "position": position})
-
-
-# ── Stats ─────────────────────────────────────────────────────────────────────
-
-def _write_stats_checkpoint(up_to_game: int):
-    window = game_stats[-10:]
-    if not window:
-        return
-    n       = len(window)
-    wins    = sum(1 for g in window if g["won"])
-    avg_vp  = sum(g["vp"]       for g in window) / n
-    avg_dur = sum(g["duration"] for g in window) / n
-    avg_pos = sum(g["position"] for g in window) / n
-    record  = {
-        "timestamp":        datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "games_so_far":     up_to_game,
-        "window":           n,
-        "win_rate":         round(wins / n, 4),
-        "avg_position":     round(avg_pos, 2),
-        "avg_vp":           round(avg_vp, 2),
-        "avg_duration_sec": round(avg_dur, 1),
-    }
-    with open(STATS_FILE, "a") as f:
-        f.write(json.dumps(record) + "\n")
-    print(f"[stats] games={up_to_game}  win_rate={record['win_rate']:.2%}  "
-          f"avg_vp={record['avg_vp']:.1f}  avg_pos={record['avg_position']:.2f}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
