@@ -1,7 +1,26 @@
-"""Shared utilities for bot_server.py and train_nn_bot_server.py."""
+"""Shared utilities for bot_server.py, train_nn_bot_server.py, and frozen nn servers."""
 
 import json
+import os
 from datetime import datetime
+
+import torch
+
+def load_nn_submodel(cls, path, label, **kwargs):
+    """Instantiate cls, load checkpoint if it exists, return model on CPU."""
+    m = cls(**kwargs)
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location="cpu")
+        try:
+            m.load_state_dict(ckpt["state_dict"])
+            print(f"Loaded {label} from {path} "
+                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
+        except RuntimeError as e:
+            print(f"[WARN] {label} checkpoint incompatible, ignoring: {e}")
+    else:
+        print(f"[WARN] No {label} checkpoint at {path} — using random weights")
+    return m
+
 
 # Placement bonus values shared by all bot servers
 PLACEMENT_BONUS = {

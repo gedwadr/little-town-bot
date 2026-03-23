@@ -6,8 +6,6 @@ A comparative study of two AI approaches for playing the worker-placement board 
 
 ![Bot playing Little Town](video/botPlay.gif)
 
-**Game server** by [Carlos Yuwono](https://github.com/carllosyuwono) — the TypeScript engine that runs Little Town matches and provides the API both bots play against.
-
 ---
 
 ## Table of Contents
@@ -457,6 +455,5 @@ stats/
 
 ## Acknowledgements
 
-- **Game server:** [Carlos Yuwono](https://github.com/carllosyuwono) — built the TypeScript game engine that runs Little Town matches and provides the API both bots play against.
 - **Game:** [Little Town](https://iellogames.com/games/little-town/) by Shun & Aya Taguchi, published by [IELLO Games](https://iellogames.com/).
 - **Model:** [Qwen 2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) by Alibaba Cloud.

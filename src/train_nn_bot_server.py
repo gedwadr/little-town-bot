@@ -29,8 +29,8 @@ from collections import defaultdict
 
 from flask import Flask, request, jsonify
 from src.server_common import (
-    get_placement_bonus, apply_reward_manipulation,
-    discounted_returns, write_stats_checkpoint,
+    apply_reward_manipulation, discounted_returns,
+    write_stats_checkpoint, load_nn_submodel,
 )
 
 from src.SFT.res_net.model_components import BoardGameBot
@@ -71,37 +71,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}  |  BOT_MODE: {BOT_MODE}")
 
 
-def _load_submodel(cls, path, label, **kwargs):
-    """Instantiate cls, load checkpoint if it exists, return model (cpu)."""
-    m = cls(**kwargs)
-    if os.path.exists(path):
-        ckpt = torch.load(path, map_location="cpu")
-        try:
-            m.load_state_dict(ckpt["state_dict"])
-            print(f"Loaded {label} from {path} "
-                  f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc','?')})")
-        except RuntimeError as e:
-            print(f"[WARN] {label} checkpoint incompatible, ignoring: {e}")
-    else:
-        print(f"[WARN] No {label} checkpoint at {path} — using random weights")
-    return m
-
-
 if BOT_MODE == "resnet":
-    model = _load_submodel(
+    model = load_nn_submodel(
         BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet",
         state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
     ).to(device)
 
 elif BOT_MODE == "cnn":
-    model = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
+    model = load_nn_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN").to(device)
 
 else:  # ensemble
-    resnet = _load_submodel(
+    resnet = load_nn_submodel(
         BoardGameBot, RESNET_CHECKPOINT_PATH, "ResNet (ensemble)",
         state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=HIDDEN_DIM, n_blocks=N_BLOCKS,
     )
-    cnn = _load_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
+    cnn = load_nn_submodel(BoardCNNBot, CNN_CHECKPOINT_PATH, "CNN (ensemble)")
 
     if os.path.exists(ENSEMBLE_CHECKPOINT_PATH):
         # Load full jointly-trained ensemble (learnable fusion weights)
