@@ -26,9 +26,12 @@ import torch
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from collections import defaultdict
-from datetime import datetime
 
 from flask import Flask, request, jsonify
+from src.server_common import (
+    get_placement_bonus, apply_reward_manipulation,
+    discounted_returns, write_stats_checkpoint,
+)
 
 from src.SFT.res_net.model_components import BoardGameBot
 from src.SFT.res_net import STATE_DIM, ACTION_DIM, HIDDEN_DIM, N_BLOCKS
@@ -46,7 +49,7 @@ CNN_CHECKPOINT_PATH      = os.environ.get("CNN_CHECKPOINT",      "./ensemble_che
 ENSEMBLE_CHECKPOINT_PATH = os.environ.get("ENSEMBLE_CHECKPOINT", "./ensemble_checkpoints/v3/best.pt")
 RL_CHECKPOINT_DIR      = f"./nn_rl_all_checkpoints/{BOT_MODE}/v3"
 RL_CHECKPOINT_PATH     = os.environ.get("RL_CHECKPOINT", f"")
-STATS_FILE = "./stats/nn_training_stats.jsonl"
+STATS_FILE = "./stats/nn_training_stats_vs_strong_heurystic_bot.jsonl"
 
 os.makedirs(RL_CHECKPOINT_DIR, exist_ok=True)
 os.makedirs("./stats", exist_ok=True)
@@ -57,9 +60,8 @@ payload = {
     "numPlayers": 2,
     "boardSide": random.choice(["A", "B"]),
     "randomizeTurnOrder": True,
-    "cpuSearchProfile": "extreme",
     "bots": [
-        {"playerID": "0"},
+        {"playerID": "0", "serviceUrl": "http://localhost:9002", "botName": "Frozen-Ensemble-RL"},
         {"playerID": "1", "serviceUrl": "http://localhost:9001", "botName": "Ensemble-RL"},
     ],
 }
@@ -145,7 +147,6 @@ episodes = defaultdict(lambda: {
     "steps":     [],   # (state [D], candidates [N,11], chosen_idx int)
     "rewards":   [],
     "player_id": None,
-    "vp_at_last_turn": None,
 })
 
 
@@ -203,15 +204,7 @@ def get_move():
     ep = episodes[game_id]
     ep["player_id"] = player_id
 
-    vp_now = parser.players.states[player_id].get("vp", 0)
-    if ep["steps"]:  # not first turn — reward is for the action taken last turn
-        vp_delta = vp_now - ep.get("vp_at_last_turn", vp_now)
-        step_reward = max(0, vp_delta * 0.1)
-        ep["rewards"].append(step_reward)
-        print(f"[REWARD] game={game_id} vp_delta={vp_delta} step_reward={step_reward:.3f}")
-
     ep["steps"].append((state_vec, candidate_vecs, chosen_idx))
-    ep["vp_at_last_turn"] = vp_now
 
     # # Log
     # with open(MOVE_FILE, "a") as f:
@@ -241,23 +234,11 @@ def game_result():
     if ep is None:
         return jsonify({"status": "unknown_game"})
 
-    # Settle last step reward (end-game VP delta)
-    vp_at_last_turn    = ep.get("vp_at_last_turn", final_vp)
-    last_turn_vp_delta = final_vp - vp_at_last_turn
-    last_step_reward   = last_turn_vp_delta * 0.1
-    ep["rewards"].append(last_step_reward)
-
-    # Final placement bonus
-    placement_bonus = {
-        2: {1: +1.0,  2: -1.0},
-        3: {1: +1.0,  2: -0.3, 3: -1.0},
-        4: {1: +1.0,  2: +0.1, 3: -0.3, 4: -1.0},
-    }
-    final_reward = placement_bonus.get(n_players, {}).get(position, 0.0)
+    final_reward = 1.0 if position == 1 else -1.0
     ep["rewards"].append(final_reward)
 
     print(f"Game {game_id} ended | position={position}/{n_players} | "
-          f"final_vp={final_vp} | rewards={ep['rewards']}")
+          f"final_vp={final_vp} | {'WIN' if position == 1 else 'LOSS'} | rewards={ep['rewards']}")
 
     _rl_update(ep)
     game_count += 1
@@ -271,6 +252,10 @@ def game_result():
     })
 
     if game_count % 10 == 0:
+        window   = game_stats[-10:]
+        win_cnt  = sum(1 for g in window if g["won"])
+        print(f"[stats] last 10 games: wins = {win_cnt}/10")
+
         ckpt_path = f"{RL_CHECKPOINT_DIR}/game_{game_count}.pt"
         torch.save({"game": game_count, "bot_mode": BOT_MODE, "state_dict": model.state_dict()}, ckpt_path)
         print(f"Saved RL checkpoint: {ckpt_path}")
@@ -287,7 +272,7 @@ def game_result():
         print(f"Saved INT8 quantized checkpoint: {quantized_path}")
 
     if game_count % 10 == 0:
-        _write_stats_checkpoint(game_count)
+        write_stats_checkpoint(game_stats, STATS_FILE, game_count)
 
     del episodes[game_id]
 
@@ -308,9 +293,7 @@ def _rl_update(ep: dict):
     """REINFORCE update on model weights."""
     steps   = ep["steps"]    # list of (state_vec, candidate_vecs, chosen_idx)
     rewards = ep["rewards"]
-    for i in range(len(rewards)):
-        if i != len(rewards) - 1:
-            rewards[i] = rewards[-1] / 2
+    apply_reward_manipulation(rewards)
     print(rewards)
     if not steps or not rewards:
         print("No steps or rewards — skipping RL update")
@@ -321,13 +304,7 @@ def _rl_update(ep: dict):
         rewards.append(0.0)
 
     # Discounted returns
-    gamma   = 0.99
-    returns = []
-    R = 0.0
-    for r in reversed(rewards[:len(steps)]):
-        R = r + gamma * R
-        returns.insert(0, R)
-
+    returns   = discounted_returns(rewards[:len(steps)])
     returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
 
     model.train()
@@ -356,32 +333,6 @@ def _rl_update(ep: dict):
           f"RL update: {len(steps)} steps | "
           f"mean_return={returns_t.mean():.3f} | "
           f"loss={total_loss.item():.4f}")
-
-
-# ── Stats ─────────────────────────────────────────────────────────────────────
-
-def _write_stats_checkpoint(up_to_game: int):
-    window = game_stats[-10:]
-    if not window:
-        return
-    n       = len(window)
-    wins    = sum(1 for g in window if g["won"])
-    avg_vp  = sum(g["vp"]       for g in window) / n
-    avg_dur = sum(g["duration"] for g in window) / n
-    avg_pos = sum(g["position"] for g in window) / n
-    record  = {
-        "timestamp":        datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "games_so_far":     up_to_game,
-        "window":           n,
-        "win_rate":         round(wins / n, 4),
-        "avg_position":     round(avg_pos, 2),
-        "avg_vp":           round(avg_vp, 2),
-        "avg_duration_sec": round(avg_dur, 1),
-    }
-    with open(STATS_FILE, "a") as f:
-        f.write(json.dumps(record) + "\n")
-    print(f"[stats] games={up_to_game}  win_rate={record['win_rate']:.2%}  "
-          f"avg_vp={record['avg_vp']:.1f}  avg_pos={record['avg_position']:.2f}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
