@@ -2,7 +2,7 @@
 
 > **Disclaimer:** This is a research project for educational purposes only. Not affiliated with, endorsed by, or connected to [IELLO Games](https://iellogames.com/) or the creators of Little Town.
 
-A comparative study of two AI approaches for playing the worker-placement board game [Little Town](https://iellogames.com/games/little-town/): a custom **neural network ensemble** (ResNet + CNN) trained via SFT and REINFORCE, and a **fine-tuned LLM** (Qwen 2.5-1.5B + LoRA) trained with FSDP distributed training. Both models learn entirely from game logs — no hand-coded strategy.
+A comparative study of two AI approaches for playing the worker-placement board game [Little Town](https://iellogames.com/games/little-town/): a custom **neural network ensemble** (ResNet + CNN) trained via SFT and REINFORCE, and a **fine-tuned LLM** (Qwen 2.5-0.5B + LoRA) trained with FSDP distributed training. Both models learn entirely from game logs — no hand-coded strategy.
 
 ![Bot playing Little Town](video/botPlay.gif)
 
@@ -28,7 +28,7 @@ A comparative study of two AI approaches for playing the worker-placement board 
 
 **Can an LLM, given the same game data, learn to play a structured board game as well as a task-specific neural network?**
 
-Board games present a controlled environment to compare these approaches: fixed rules, discrete actions, measurable outcomes (Victory Points and win rate). The NN branch uses a structured state vector (343 floats) and scores actions directly. The LLM branch receives the same game state as a text prompt and generates an action choice. Both are trained on identical game logs.
+Board games present a controlled environment to compare these approaches: fixed rules, discrete actions, measurable outcomes (Victory Points and win rate). The NN branch uses a structured state vector (343 floats) and scores actions directly. The LLM branch receives the same game state as a text prompt and selects from the same set of legal moves. Both are trained on identical game logs.
 
 ---
 
@@ -218,13 +218,22 @@ loss = (F.cross_entropy(scores, correct_idx, reduction='none')
 
 ### Reinforcement Learning (REINFORCE)
 
-Online policy-gradient update after each game:
+Online policy-gradient update after each game. Both the NN and LLM went through the same reward shaping experiments.
+
+#### Reward Shaping: Five Approaches, One Winner
+
+| # | Approach | Result | Lesson |
+|---|----------|--------|--------|
+| 1 | Reward food-gathering moves; bonus when all workers fed (curriculum: fades after 200 games) | Model hoarded food, ignored VP | Dense subtask reward dominated the overall objective |
+| 2 | Reward every move that generates VP | Greedy, short-sighted play | Immediate reward for long-horizon goals causes myopic behaviour |
+| 3 | +1 for winning, 0 otherwise | Too sparse; REINFORCE couldn't assign credit across 20-40 moves | Pure win/loss starves the model of gradient signal |
+| 4 | +1 for winning, −1 for losing, no per-move signal | Slightly better, but model couldn't distinguish good moves from lucky ones | Per-game signal alone is insufficient |
+| **5** | **Win: +1 game + 0.5 to every move. Loss: −1 game − 0.5 to every move** | **Win rate 44% → 65%** | **Dense per-move credit anchored to the correct objective** |
+
+The winning formula works because every move in a winning game receives positive reinforcement (+0.5), and every move in a losing game is penalised (−0.5). Combined with discounted returns (γ=0.99), later moves still receive more credit. For the LLM, since it never won against the frozen NN ensemble, the threshold was modified to VP > 0 instead of winning.
 
 ```python
-# Reward structure
-placement      = {1: +1, 2: -1.0}
-
-# REINFORCE update
+# REINFORCE update (final reward structure)
 for (state, candidates, chosen_idx), G in zip(steps, returns):
     scores   = model(state, candidates)
     log_prob = F.log_softmax(scores, dim=-1)[chosen_idx]
@@ -237,7 +246,7 @@ optimizer.step()
 
 **Three failure modes discovered and fixed:**
 
-1. **OOM from full-episode backward** — accumulating loss across all steps held all intermediate tensors. Fixed with per-action forward pass and immediate `del` + `torch.cuda.empty_cache()`.
+1. **OOM from full-episode backward** — accumulating loss across all steps held all intermediate tensors. Fixed with per-action forward pass and immediate `del` + `torch.cuda.empty_cache()`. Critical on RTX 2060's 6GB VRAM.
 2. **Return normalisation killed gradients** — when episode reward variance was low, `returns.std() ≈ 0` made all normalised returns ≈ 0. Removed normalisation; gradient clipping provides stability instead.
 3. **High LR erased SFT weights** — at `lr=1e-4`, 20 losing games degraded avg VP from +34 to −7. Reduced to `lr=1e-5`; the SFT foundation remained intact.
 
@@ -247,14 +256,14 @@ optimizer.step()
 
 ### Approach
 
-Instead of encoding the game state as a structured vector, the LLM receives a **text description** of the game state and candidate actions, generated by `game_parser.py`. The model outputs the index of its chosen action.
+Instead of encoding the game state as a structured vector, the LLM receives a **text description** of the game state and candidate actions, generated by `game_parser.py`. The model selects from the same set of legal moves as the NN — both models face an identical constrained choice.
 
-| Component | Detail                                                                |
-|-----------|-----------------------------------------------------------------------|
-| Base model | Qwen 2.5-0.5B                                                         |
-| Fine-tuning | LoRA (rank 16, alpha 32, target: q_proj, v_proj)                      |
-| Training | SFT on game logs → REINFORCE with VP > 0 reward                       |
-| Distributed | PyTorch FSDP (see [Distributed Training](#distributed-training-fsdp)) |
+| Component | Detail |
+|-----------|--------|
+| Base model | Qwen 2.5-0.5B (chosen to fit RTX 2060's 6GB VRAM) |
+| Fine-tuning | LoRA (rank 16, alpha 32, target: q_proj, v_proj) |
+| Training | SFT on game logs → REINFORCE with VP > 0 reward |
+| Distributed | PyTorch FSDP on Kaggle T4×2 (see [Distributed Training](#distributed-training-fsdp)) |
 
 ### Why the LLM struggles
 
@@ -268,13 +277,13 @@ This is a useful negative result: it establishes that for small-scale structured
 
 ## Distributed Training (FSDP)
 
-The LLM SFT training uses **PyTorch Fully Sharded Data Parallel (FSDP)** to distribute Qwen 2.5-0.5B + LoRA training across multiple GPUs.
+All single-GPU training was done on an **NVIDIA GeForce RTX 2060 (6GB VRAM)**. Distributed training experiments ran on **Kaggle T4×2** (free tier). The LLM SFT uses **PyTorch Fully Sharded Data Parallel (FSDP)** to distribute Qwen 2.5-0.5B + LoRA training across multiple GPUs.
 
 ### Configuration
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Sharding strategy | `SHARD_GRAD_OP` | Model weights (1.5B, ~3GB in bf16) fit on a single GPU; only gradients and optimizer states need sharding. `FULL_SHARD` would add unnecessary all-gather overhead. |
+| Sharding strategy | `SHARD_GRAD_OP` | Model weights (0.5B, ~1GB in bf16) fit on a single GPU; only gradients and optimizer states need sharding. `FULL_SHARD` would add unnecessary all-gather overhead. |
 | Mixed precision | bf16 (params, reduce, buffers) | Halves memory and compute vs float32. bf16 chosen over fp16 for numerical stability (same exponent range as float32). |
 | LoRA + FSDP | `use_orig_params=True` | Required to preserve the distinction between frozen base parameters and trainable LoRA adapters. Without this, FSDP flattens all parameters and the optimizer allocates states for frozen weights, negating LoRA's memory advantage. |
 | Gradient clipping | max_norm=1.0 | Prevents gradient spikes from noisy game reward signals. |
@@ -306,10 +315,10 @@ The LLM SFT training uses **PyTorch Fully Sharded Data Parallel (FSDP)** to dist
 
 ### Data Volume Effect
 
-| Model               | SFT Data | Opponent | Win Rate | Avg VP | VP Δ from baseline |
-|---------------------|----------|----------|----------|--------|-------------------|
-| NN Ensemble         | 100 matches | Heuristic bot | 15% | 29.9 | — |
-| NN Ensemble         | 1000 matches + self-play RL | Heuristic bot | **52%** | **33.1** | +3.2 |
+| Model | SFT Data | Opponent | Win Rate | Avg VP | VP Δ from baseline |
+|-------|----------|----------|----------|--------|-------------------|
+| NN Ensemble | 100 matches | Heuristic bot | 15% | 29.9 | — |
+| NN Ensemble | 1000 matches + self-play RL | Heuristic bot | **52%** | **33.1** | +3.2 |
 | LLM (Qwen 2.5-0.5B) | 100 matches | Frozen NN ensemble | 0% | −15.6 | — |
 | LLM (Qwen 2.5-0.5B) | 1000 matches | Frozen NN ensemble | 0% | **−2.9** | +12.7 |
 
@@ -332,11 +341,11 @@ Win rate improved +20.9 percentage points while average VP remained flat — the
 
 1. **Structured encoding is a massive advantage.** The NN receives 343 pre-computed floats that directly encode spatial relationships, resource counts, and building adjacency. The LLM must parse the same information from serialised text — an inherently lossy transformation.
 
-2. **Action scoring vs generation.** The NN scores all legal actions simultaneously in a single forward pass and picks the highest. The LLM generates a response token-by-token, with no guarantee the output maps to a valid action.
+2. **Encoding efficiency.** The NN processes a compact 343-float vector and scores all legal actions in a single forward pass. The LLM processes the same information as a long text prompt — hundreds of tokens describing what 343 floats encode directly. Both select from the same legal move set, but the NN's representation is far more compact and preserves spatial structure that text serialisation loses.
 
 3. **Data efficiency.** The NN reaches 52% win rate vs the heuristic with ~1000 matches of SFT data plus RL. The LLM with 1000 matches of data still produces negative VP.
 
-4. **Self-play RL compounds.** The NN's encode-then-score architecture produces clean gradients for REINFORCE — each action has a direct score and log-probability. The LLM's autoregressive generation makes credit assignment noisier.
+4. **Credit assignment is cleaner with direct scoring.** The NN's encode-then-score architecture gives each legal action an explicit score and log-probability. REINFORCE gets a clean gradient per action. The LLM must process a long text prompt before selecting, making credit assignment less direct.
 
 ### Where the LLM shows promise
 
